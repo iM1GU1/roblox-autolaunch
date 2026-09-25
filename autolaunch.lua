@@ -2,10 +2,70 @@
 -- ON/OFF: activar o desactivar.
 -- RightShift: mostrar / ocultar menu.
 -- Deja el cursor sobre la zona de lanzamiento.
--- Umbral calibrado segun la prueba del usuario: 97% -> resultado 99%.
+-- v2: calibracion experimental con resultados estables tras el clic.
 -- El resultado puede variar con los fotogramas y la latencia del executor.
 
-local TRIGGER = 97
+-- Learn from batches of three stable results; never infer early/late
+-- from a single low score. Compare neighboring thresholds instead.
+local function newCalibration()
+    return {threshold = 97, bestThreshold = 97, bestScore = nil,
+        direction = 1, scores = {}, tried = {}}
+end
+
+local function recordResult(c, score)
+    table.insert(c.scores, score)
+    if #c.scores < 3 then return end
+    local average = 0
+    for _, value in ipairs(c.scores) do average = average + value end
+    average = average / #c.scores
+    c.scores = {}
+    c.tried[c.threshold] = true
+
+    if c.bestScore == nil or average > c.bestScore + 0.2 then
+        c.bestScore = average
+        c.bestThreshold = c.threshold
+        c.tried = {[c.threshold] = true}
+    elseif c.threshold ~= c.bestThreshold then
+        c.direction = -c.direction
+    else
+        -- Refresh the reference as timing conditions change.
+        c.bestScore = average
+    end
+
+    if average >= 99 then
+        c.bestScore = average
+        c.bestThreshold = c.threshold
+        return
+    end
+
+    local candidate = c.bestThreshold + c.direction
+    if candidate < 94 or candidate > 99 or c.tried[candidate] then
+        c.direction = -c.direction
+        candidate = c.bestThreshold + c.direction
+    end
+    if candidate >= 94 and candidate <= 99 and not c.tried[candidate] then
+        c.threshold = candidate
+    else
+        c.threshold = c.bestThreshold
+        c.tried = {[c.bestThreshold] = true}
+    end
+end
+
+-- A stable value after a recent moving bar is only a result candidate.
+-- Reject timeouts, resets, vanished UI and long frame stalls.
+local function observeResult(shot, value, now, dt)
+    if dt > 0.2 or now - shot.started > 2 then return "reject" end
+    if value == nil or value < 80 then return "reject" end
+    if value ~= shot.value then
+        shot.value = value
+        shot.changed = now
+    end
+    if now - shot.changed >= 0.45 and now - shot.started >= 0.5 then
+        return "accept", value
+    end
+end
+
+local calibration = newCalibration()
 local COOLDOWN = 0.5
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
@@ -37,6 +97,9 @@ local previous
 local armed = false
 local lastClick = -math.huge
 local connections = {}
+local shot
+local waitingForNewRound = false
+local lastMovement = -math.huge
 
 local function connect(signal, callback)
     local connection = signal:Connect(callback)
@@ -70,7 +133,7 @@ end
 if not gui.Parent then gui.Parent = pg end
 
 local panel = make("Frame", {
-    Size = UDim2.fromOffset(290, 170),
+    Size = UDim2.fromOffset(310, 200),
     Position = UDim2.fromOffset(25, 100),
     BackgroundColor3 = Color3.fromRGB(23, 26, 39),
     BorderSizePixel = 0,
@@ -84,7 +147,7 @@ make("TextLabel", {
     Size = UDim2.new(1, -24, 0, 38),
     Position = UDim2.fromOffset(12, 4),
     BackgroundTransparency = 1,
-    Text = "AUTO LAUNCH",
+    Text = "AUTO LAUNCH v2",
     TextColor3 = Color3.fromRGB(230, 237, 255),
     Font = Enum.Font.GothamBold,
     TextSize = 17,
@@ -112,12 +175,23 @@ local status = make("TextLabel", {
 }, panel)
 make("TextLabel", {
     Size = UDim2.new(1, -24, 0, 22),
-    Position = UDim2.fromOffset(12, 140),
+    Position = UDim2.fromOffset(12, 170),
     BackgroundTransparency = 1,
     Text = "RightShift - Mostrar / ocultar",
     TextColor3 = Color3.fromRGB(130, 145, 185),
     Font = Enum.Font.Gotham,
     TextSize = 11,
+}, panel)
+
+local resultLabel = make("TextLabel", {
+    Size = UDim2.new(1, -24, 0, 28),
+    Position = UDim2.fromOffset(12, 136),
+    BackgroundTransparency = 1,
+    Text = "Calibrando: esperando resultados",
+    TextColor3 = Color3.fromRGB(113, 220, 172),
+    Font = Enum.Font.Gotham,
+    TextSize = 11,
+    TextWrapped = true,
 }, panel)
 
 local function reset()
@@ -171,6 +245,7 @@ connect(toggle.Activated, function()
         return
     end
     enabled = not enabled
+    shot = nil
     reset()
     paintToggle()
     status.Text = enabled
@@ -195,9 +270,28 @@ task.spawn(function()
         task.wait(1)
     end
 end)
-connect(RunService.Heartbeat, function()
+connect(RunService.Heartbeat, function(dt)
     if not alive or not target then return end
     local percent = read(target)
+    local now = os.clock()
+
+    if shot then
+        local outcome, score = observeResult(shot, percent, now, dt)
+        if outcome == "accept" then
+            recordResult(calibration, score)
+            resultLabel.Text = "Resultado detectado: " .. score
+                .. "% | Muestras: " .. #calibration.scores .. "/3"
+            shot = nil
+        elseif outcome == "reject" then
+            resultLabel.Text = "Resultado no confirmado; sin ajuste"
+            shot = nil
+        end
+        if shot then
+            status.Text = "Leyendo resultado..."
+            return
+        end
+    end
+
     if percent == nil then
         target = nil
         reset()
@@ -209,35 +303,49 @@ connect(RunService.Heartbeat, function()
         status.Text = "OFF - Barra: " .. percent .. "%"
         return
     end
+    if waitingForNewRound then
+        if percent < 80 then
+            waitingForNewRound = false
+            reset()
+        else
+            status.Text = "Esperando nueva carga"
+            return
+        end
+    end
     if cursorOverMenu() or UIS:GetFocusedTextBox() then
         reset()
         status.Text = "Aparta el cursor del menu y cierra el chat"
         return
     end
     local old = previous
+    local recentMovement = now - lastMovement < 0.2
     previous = percent
-    if percent < TRIGGER then
+    if old ~= nil and old ~= percent then lastMovement = now end
+    if percent < calibration.threshold then
         armed = true
         status.Text = "ON - Barra: " .. percent .. "%"
         return
     end
-    local crossed = armed
-        and old ~= nil
-        and old < TRIGGER
-        and percent >= TRIGGER
-        and percent > old
+    local crossed = armed and old ~= nil
+        and old < calibration.threshold
+        and percent >= calibration.threshold and percent > old
     if not crossed then return end
     armed = false
-    local now = os.clock()
-    if now - lastClick < COOLDOWN then return end
+    if dt > 0.1 or now - lastClick < COOLDOWN then return end
     local confirmed = read(target)
-    if not confirmed or confirmed < TRIGGER or confirmed < percent then
-        return
-    end
+    if not confirmed or confirmed < calibration.threshold
+        or confirmed < percent then return end
+
     lastClick = now
+    waitingForNewRound = true
     local ok, err = pcall(click)
     if ok then
-        status.Text = "Clic enviado - Esperando nueva subida"
+        if recentMovement then
+            shot = {started = now, changed = now, value = confirmed}
+        else
+            resultLabel.Text = "Movimiento insuficiente; sin ajuste"
+        end
+        status.Text = "Clic enviado"
     else
         enabled = false
         reset()
@@ -246,6 +354,7 @@ connect(RunService.Heartbeat, function()
         warn("Auto Launch: " .. tostring(err))
     end
 end)
+
 env.StopAutoLaunch = function()
     if not alive then return end
     alive = false
@@ -253,3 +362,5 @@ env.StopAutoLaunch = function()
     for _, connection in ipairs(connections) do connection:Disconnect() end
     gui:Destroy()
 end
+
+
